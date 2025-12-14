@@ -1,23 +1,4 @@
 import torch
-from cs336_systems.benchmarking import benchmark_transformer
-
-# (a) Benchmark your attention implementation at different scales. Write a script that will:
-# (a) Fix the batch size to 8 and don’t use multihead attention (i.e. remove the head dimension).
-# (b) Iterate through the cartesian product of [16, 32, 64, 128] for the head embedding dimension dmodel, and [256, 1024, 4096, 8192, 16384] for the sequence length.
-# (c) Create random inputs Q, K, V for the appropriate size.
-# (d) Time 100 forward passes through attention using the inputs.
-# (e) Measure how much memory is in use before the backward pass starts, and time 100 backward
-# passes.
-# (f) Make sure to warm up, and to call torch.cuda.synchronize() after each forward/backward
-# pass.
-# Report the timings (or out-of-memory errors) you get for these configurations. At what size do
-# you get out-of-memory errors? Do the accounting for the memory usage of attention in one of the
-# smallest configurations you find that runs out of memory (you can use the equations for memory
-# usage of Transformers from Assignment 1). How does the memory saved for backward change
-# with the sequence length? What would you do to eliminate this memory cost?
-# Deliverable: A table with your timings, your working out for the memory usage, and a 1-2
-# paragraph response.
-
 import timeit
 
 if __name__ == "__main__":
@@ -35,10 +16,11 @@ if __name__ == "__main__":
                 
                 from cs336_basics.transformer.multihead_self_attention import MultiHeadSelfAttention
                 mha = MultiHeadSelfAttention(d_model=d_model, num_heads=1, device=device).to(device)
+                mha = torch.compile(mha)
                 Q = torch.randn((batch_size, seq_len, d_model), device=device, requires_grad=True)
 
                 # Warmup
-                for _ in range(10):
+                for _ in range(20):
                     out = mha(Q)
                     out.mean().backward()
                     mha.zero_grad()
