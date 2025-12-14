@@ -9,13 +9,16 @@ import torch.cuda.nvtx as nvtx
 def benchmark_transformer(vocab_size: int, context_length: int, num_layers: int, d_model: int, num_heads: int, d_ff: int, with_rope: bool = False,
                  rope_theta: float | None = None, max_seq_len: int | None = None,
                  device=None, dtype=None, batch_size: int = 4, warmup_steps: int = 10, benchmark_steps: int = 50, backward: bool = False,
-                 use_bf16: bool = False, memory_snapshot: bool = False, snapshot_path: str = "memory_snapshot.pickle") -> None:
+                 use_bf16: bool = False, memory_snapshot: bool = False, snapshot_path: str = "memory_snapshot.pickle", compile: bool = False) -> None:
     
     print(f"  Config: batch={batch_size}, context={context_length}, layers={num_layers}")
 
     # Initialize the model
     model = transformer.TransformerLM(vocab_size, context_length, num_layers, d_model, num_heads, d_ff, with_rope,
                  rope_theta, max_seq_len, device, dtype).to(device)
+    
+    if compile:
+        model = torch.compile(model)
 
     model.train()
     # Generate a random batch of data
@@ -72,11 +75,12 @@ def benchmark_transformer(vocab_size: int, context_length: int, num_layers: int,
         torch.cuda.synchronize()
         end_time = timeit.default_timer()
         times.append(end_time - start_time)
-
+        
+    peak_memory_gb = torch.cuda.max_memory_allocated() / (1024 ** 3)
+    print(f"Peak memory: {peak_memory_gb:.2f} GB")
     if memory_snapshot:
         if torch.cuda.is_available() and hasattr(torch.cuda.memory, '_dump_snapshot'):
-            peak_memory_gb = torch.cuda.max_memory_allocated() / (1024 ** 3)
-            print(f"Peak memory: {peak_memory_gb:.2f} GB")
+
             torch.cuda.memory._dump_snapshot(snapshot_path)
             torch.cuda.memory._record_memory_history(enabled=None)
         else:
@@ -101,6 +105,7 @@ if __name__ == "__main__":
     parser.add_argument('--sizes', type=str, nargs='*', default=['small','medium','large','xl','2.7B'],
                         help='Which model sizes to benchmark')
     parser.add_argument('--forward-only', action='store_true', help='Skip backward pass')
+    parser.add_argument('--compile', action='store_true', help='Use torch.compile')
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -117,6 +122,7 @@ if __name__ == "__main__":
     warmup_steps = args.warmup
     benchmark_steps = args.steps
     backward = not args.forward_only
+    compile = args.compile
 
     for size_name in args.sizes:
         if size_name not in model_sizes:
@@ -132,7 +138,7 @@ if __name__ == "__main__":
                                       device=device, batch_size=batch_size,
                                       warmup_steps=warmup_steps, benchmark_steps=benchmark_steps,
                                       backward=backward, use_bf16=use_bf16,
-                                      memory_snapshot=args.memory_snapshot, snapshot_path=args.snapshot_path)
+                                      memory_snapshot=args.memory_snapshot, snapshot_path=args.snapshot_path, compile=compile)
             except RuntimeError as e:
                 print(f"  Skipping (OOM or other error): {e}")
                 torch.cuda.empty_cache()
