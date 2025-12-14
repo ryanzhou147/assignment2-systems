@@ -3,6 +3,7 @@ import torch
 import cs336_basics.transformer.transformer as transformer
 import cs336_basics.optimizer.cross_entropy as cross_entropy
 import cs336_basics.optimizer.adamw as adamw
+import torch.cuda.nvtx as nvtx
 
 def benchmark_transformer(vocab_size: int, context_length: int, num_layers: int, d_model: int, num_heads: int, d_ff: int, with_rope: bool = False,
                  rope_theta: float | None = None, max_seq_len: int | None = None,
@@ -20,33 +21,40 @@ def benchmark_transformer(vocab_size: int, context_length: int, num_layers: int,
     optimizer = adamw.AdamW(model.parameters())
 
     # Warm-up steps
-    for _ in range(warmup_steps):
-        optimizer.zero_grad()
-        outputs = model(input_data)
-        if backward:
-            loss = criterion(outputs.view(-1, vocab_size), target_data.view(-1))
-            loss.backward()
-            optimizer.step()
+    with nvtx.range("warmup"):
+        for _ in range(warmup_steps):
+            optimizer.zero_grad()
+            outputs = model(input_data)
+            if backward:
+                loss = criterion(outputs.view(-1, vocab_size), target_data.view(-1))
+                loss.backward()
+                optimizer.step()
     
     # Benchmark steps
     times = []
     for _ in range(benchmark_steps):
-    
         torch.cuda.synchronize()
         start_time = timeit.default_timer()
-
-        optimizer.zero_grad()
-        outputs = model(input_data)
-
+        
+        with nvtx.range("zero_grad"):
+            optimizer.zero_grad()
+        
+        with nvtx.range("forward"):
+            outputs = model(input_data)
+        
         if backward:
-            loss = criterion(outputs.view(-1, vocab_size), target_data.view(-1))
-            loss.backward()
-            optimizer.step()
-
+            with nvtx.range("loss"):
+                loss = criterion(outputs.view(-1, vocab_size), target_data.view(-1))
+            
+            with nvtx.range("backward"):
+                loss.backward()
+            
+            with nvtx.range("optimizer_step"):
+                optimizer.step()
+        
         torch.cuda.synchronize()
         end_time = timeit.default_timer()
         times.append(end_time - start_time)
-        start_time = end_time
 
     avg_time_per_step = sum(times) / benchmark_steps
     std_time_per_step = (sum((t - avg_time_per_step) ** 2 for t in times) / benchmark_steps) ** 0.5
