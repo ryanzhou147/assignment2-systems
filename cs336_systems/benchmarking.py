@@ -1,5 +1,6 @@
 import timeit
 import torch
+from contextlib import nullcontext
 import cs336_basics.transformer.transformer as transformer
 import cs336_basics.optimizer.cross_entropy as cross_entropy
 import cs336_basics.optimizer.adamw as adamw
@@ -7,7 +8,8 @@ import torch.cuda.nvtx as nvtx
 
 def benchmark_transformer(vocab_size: int, context_length: int, num_layers: int, d_model: int, num_heads: int, d_ff: int, with_rope: bool = False,
                  rope_theta: float | None = None, max_seq_len: int | None = None,
-                 device=None, dtype=None, batch_size: int = 4, warmup_steps: int = 10, benchmark_steps: int = 50, backward: bool = False):
+                 device=None, dtype=None, batch_size: int = 4, warmup_steps: int = 10, benchmark_steps: int = 50, backward: bool = False,
+                 use_bf16: bool = False):
     
     # Initialize the model
     model = transformer.TransformerLM(vocab_size, context_length, num_layers, d_model, num_heads, d_ff, with_rope,
@@ -20,15 +22,22 @@ def benchmark_transformer(vocab_size: int, context_length: int, num_layers: int,
     criterion = cross_entropy.CrossEntropyLoss()
     optimizer = adamw.AdamW(model.parameters())
 
+    # choose autocast context: bf16 when requested and running on CUDA, else no-op
+    if use_bf16 and torch.cuda.is_available():
+        amp_ctx = torch.autocast(device_type='cuda', dtype=torch.bfloat16)
+    else:
+        amp_ctx = nullcontext()
+
     # Warm-up steps
     with nvtx.range("warmup"):
         for _ in range(warmup_steps):
-            optimizer.zero_grad()
-            outputs = model(input_data)
-            if backward:
-                loss = criterion(outputs.view(-1, vocab_size), target_data.view(-1))
-                loss.backward()
-                optimizer.step()
+            with amp_ctx:
+                optimizer.zero_grad()
+                outputs = model(input_data)
+                if backward:
+                    loss = criterion(outputs.view(-1, vocab_size), target_data.view(-1))
+                    loss.backward()
+                    optimizer.step()
     
     # Benchmark steps
     times = []
@@ -36,7 +45,7 @@ def benchmark_transformer(vocab_size: int, context_length: int, num_layers: int,
 
         torch.cuda.synchronize()
         start_time = timeit.default_timer()
-        with torch.autocast(device_type='cuda', dtype=torch.float16):        
+        with amp_ctx:
             with nvtx.range("zero_grad"):
                 optimizer.zero_grad()
             
@@ -79,14 +88,19 @@ if __name__ == "__main__":
 
     for size_name, (d_model, d_ff, num_layers, num_heads) in model_sizes.items():
         print(f"Benchmarking {size_name} model:")
-        benchmark_transformer(vocab_size, context_length, num_layers, d_model, num_heads, d_ff,
-                              device=device, batch_size=batch_size,
-                              warmup_steps=warmup_steps, benchmark_steps=benchmark_steps,
-                              backward=True)
-        benchmark_transformer(vocab_size, context_length, num_layers, d_model, num_heads, d_ff,
-                        device=device, batch_size=batch_size,
-                        warmup_steps=warmup_steps, benchmark_steps=benchmark_steps,
-                        backward=False)
+        for use_bf16 in (False, True):
+            print(f"  Mixed BF16: {use_bf16}")
+            try:
+                benchmark_transformer(vocab_size, context_length, num_layers, d_model, num_heads, d_ff,
+                                      device=device, batch_size=batch_size,
+                                      warmup_steps=warmup_steps, benchmark_steps=benchmark_steps,
+                                      backward=True, use_bf16=use_bf16)
+                benchmark_transformer(vocab_size, context_length, num_layers, d_model, num_heads, d_ff,
+                                      device=device, batch_size=batch_size,
+                                      warmup_steps=warmup_steps, benchmark_steps=benchmark_steps,
+                                      backward=False, use_bf16=use_bf16)
+            except RuntimeError as e:
+                print(f"  Skipping (OOM or other error): {e}")
 
 # import torch.nn as nn
 # if __name__ == "__main__":
