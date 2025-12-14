@@ -9,8 +9,10 @@ import torch.cuda.nvtx as nvtx
 def benchmark_transformer(vocab_size: int, context_length: int, num_layers: int, d_model: int, num_heads: int, d_ff: int, with_rope: bool = False,
                  rope_theta: float | None = None, max_seq_len: int | None = None,
                  device=None, dtype=None, batch_size: int = 4, warmup_steps: int = 10, benchmark_steps: int = 50, backward: bool = False,
-                 use_bf16: bool = False):
+                 use_bf16: bool = False, memory_snapshot: bool = False, snapshot_path: str = "memory_snapshot.pickle") -> None:
     
+    print(f"  Config: batch={batch_size}, context={context_length}, layers={num_layers}")
+
     # Initialize the model
     model = transformer.TransformerLM(vocab_size, context_length, num_layers, d_model, num_heads, d_ff, with_rope,
                  rope_theta, max_seq_len, device, dtype).to(device)
@@ -41,10 +43,15 @@ def benchmark_transformer(vocab_size: int, context_length: int, num_layers: int,
     
     # Benchmark steps
     times = []
+    if torch.cuda.is_available() and hasattr(torch.cuda.memory, '_record_memory_history'):
+            torch.cuda.reset_peak_memory_stats()
+            torch.cuda.memory._record_memory_history(max_entries=1000000)
+
     for _ in range(benchmark_steps):
 
         torch.cuda.synchronize()
         start_time = timeit.default_timer()
+
         with amp_ctx:
             with nvtx.range("zero_grad"):
                 optimizer.zero_grad()
@@ -66,12 +73,36 @@ def benchmark_transformer(vocab_size: int, context_length: int, num_layers: int,
         end_time = timeit.default_timer()
         times.append(end_time - start_time)
 
+    if memory_snapshot:
+        if torch.cuda.is_available() and hasattr(torch.cuda.memory, '_dump_snapshot'):
+            peak_memory_gb = torch.cuda.max_memory_allocated() / (1024 ** 3)
+            print(f"Peak memory: {peak_memory_gb:.2f} GB")
+            torch.cuda.memory._dump_snapshot(snapshot_path)
+            torch.cuda.memory._record_memory_history(enabled=None)
+        else:
+            print("Warning: CUDA memory snapshot API not available; no snapshot written")
+
     avg_time_per_step = sum(times) / benchmark_steps
     std_time_per_step = (sum((t - avg_time_per_step) ** 2 for t in times) / benchmark_steps) ** 0.5
     print(f"Average time per step ({'forward + backward' if backward else 'forward only'}): {avg_time_per_step:.6f} seconds +/- {std_time_per_step:.6f} seconds")
     return avg_time_per_step
 
 if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--memory-snapshot', action='store_true', help='Record CUDA memory history and dump a snapshot')
+    parser.add_argument('--snapshot-path', type=str, default='./memory_snapshot.pickle', help='Path to write memory snapshot')
+    parser.add_argument('--bf16', action='store_true', help='Run benchmarks with BF16 autocast when available')
+    parser.add_argument('--batch', type=int, default=4)
+    parser.add_argument('--context', type=int, default=512)
+    parser.add_argument('--warmup', type=int, default=2)
+    parser.add_argument('--steps', type=int, default=10)
+    parser.add_argument('--sizes', type=str, nargs='*', default=['small','medium','large','xl','2.7B'],
+                        help='Which model sizes to benchmark')
+    parser.add_argument('--forward-only', action='store_true', help='Skip backward pass')
+    args = parser.parse_args()
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model_sizes = {
         "small": (768, 3072, 12, 12),
@@ -81,50 +112,27 @@ if __name__ == "__main__":
         "2.7B": (2560, 10240, 32, 32)
     }
     vocab_size = 10000
-    context_length = 512
-    batch_size = 4
-    warmup_steps = 2
-    benchmark_steps = 10
+    context_length = args.context
+    batch_size = args.batch
+    warmup_steps = args.warmup
+    benchmark_steps = args.steps
+    backward = not args.forward_only
 
-    for size_name, (d_model, d_ff, num_layers, num_heads) in model_sizes.items():
+    for size_name in args.sizes:
+        if size_name not in model_sizes:
+            print(f"Unknown model size: {size_name}, skipping")
+            continue
+        d_model, d_ff, num_layers, num_heads = model_sizes[size_name]
         print(f"Benchmarking {size_name} model:")
-        for use_bf16 in (False, True):
+        bf16_options = [False, True] if args.bf16 else [False]
+        for use_bf16 in bf16_options:
             print(f"  Mixed BF16: {use_bf16}")
             try:
                 benchmark_transformer(vocab_size, context_length, num_layers, d_model, num_heads, d_ff,
                                       device=device, batch_size=batch_size,
                                       warmup_steps=warmup_steps, benchmark_steps=benchmark_steps,
-                                      backward=True, use_bf16=use_bf16)
-                benchmark_transformer(vocab_size, context_length, num_layers, d_model, num_heads, d_ff,
-                                      device=device, batch_size=batch_size,
-                                      warmup_steps=warmup_steps, benchmark_steps=benchmark_steps,
-                                      backward=False, use_bf16=use_bf16)
+                                      backward=backward, use_bf16=use_bf16,
+                                      memory_snapshot=args.memory_snapshot, snapshot_path=args.snapshot_path)
             except RuntimeError as e:
                 print(f"  Skipping (OOM or other error): {e}")
-
-# import torch.nn as nn
-# if __name__ == "__main__":
-#     with torch.autocast(device_type='cuda', dtype=torch.float16):
-#         x = torch.randn(4, 10, device='cuda')
-        
-#         out = nn.Linear(10, 10).cuda()(x)
-#         print(f"Linear output: {out.dtype}")        # float16
-        
-#         out = nn.LayerNorm(10).cuda()(x)
-#         print(f"LayerNorm output: {out.dtype}")     # float32
-        
-#         out = nn.ReLU()(x)
-#         print(f"ReLU output: {out.dtype}")          # float32 (input was fp32)
-
-# class ToyModel(nn.Module):
-#     def __init__(self, in_features: int, out_features: int):
-#         super().__init__()
-#         self.fc1 = nn.Linear(in_features, 10, bias=False)
-#         self.ln = nn.LayerNorm(10)
-#         self.fc2 = nn.Linear(10, out_features, bias=False)
-#         self.relu = nn.ReLU()
-#     def forward(self, x):
-#         x = self.relu(self.fc1(x))
-#         x = self.ln(x)
-#         x = self.fc2(x)
-#         return x
+                torch.cuda.empty_cache()
