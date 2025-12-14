@@ -33,25 +33,26 @@ def benchmark_transformer(vocab_size: int, context_length: int, num_layers: int,
     # Benchmark steps
     times = []
     for _ in range(benchmark_steps):
+
         torch.cuda.synchronize()
         start_time = timeit.default_timer()
-        
-        with nvtx.range("zero_grad"):
-            optimizer.zero_grad()
-        
-        with nvtx.range("forward"):
-            outputs = model(input_data)
-        
-        if backward:
-            with nvtx.range("loss"):
-                loss = criterion(outputs.view(-1, vocab_size), target_data.view(-1))
+        with torch.autocast(device_type='cuda', dtype=torch.float16):        
+            with nvtx.range("zero_grad"):
+                optimizer.zero_grad()
             
-            with nvtx.range("backward"):
-                loss.backward()
+            with nvtx.range("forward"):
+                outputs = model(input_data)
             
-            with nvtx.range("optimizer_step"):
-                optimizer.step()
-        
+            if backward:
+                with nvtx.range("loss"):
+                    loss = criterion(outputs.view(-1, vocab_size), target_data.view(-1))
+                
+                with nvtx.range("backward"):
+                    loss.backward()
+                
+                with nvtx.range("optimizer_step"):
+                    optimizer.step()
+            
         torch.cuda.synchronize()
         end_time = timeit.default_timer()
         times.append(end_time - start_time)
@@ -86,3 +87,30 @@ if __name__ == "__main__":
                         device=device, batch_size=batch_size,
                         warmup_steps=warmup_steps, benchmark_steps=benchmark_steps,
                         backward=False)
+
+# import torch.nn as nn
+# if __name__ == "__main__":
+#     with torch.autocast(device_type='cuda', dtype=torch.float16):
+#         x = torch.randn(4, 10, device='cuda')
+        
+#         out = nn.Linear(10, 10).cuda()(x)
+#         print(f"Linear output: {out.dtype}")        # float16
+        
+#         out = nn.LayerNorm(10).cuda()(x)
+#         print(f"LayerNorm output: {out.dtype}")     # float32
+        
+#         out = nn.ReLU()(x)
+#         print(f"ReLU output: {out.dtype}")          # float32 (input was fp32)
+
+# class ToyModel(nn.Module):
+#     def __init__(self, in_features: int, out_features: int):
+#         super().__init__()
+#         self.fc1 = nn.Linear(in_features, 10, bias=False)
+#         self.ln = nn.LayerNorm(10)
+#         self.fc2 = nn.Linear(10, out_features, bias=False)
+#         self.relu = nn.ReLU()
+#     def forward(self, x):
+#         x = self.relu(self.fc1(x))
+#         x = self.ln(x)
+#         x = self.fc2(x)
+#         return x
