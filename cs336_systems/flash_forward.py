@@ -41,6 +41,11 @@ class FlashAttentionFunctionPyTorch(torch.autograd.Function):
                     
                     # S_ij = Qi @ K_j^T / sqrt(d)
                     Sij = (Qi @ Kj.T) * scale  # (Bq, Bk)
+
+                    if is_causal:
+                        q_idx = torch.arange(i_start, i_end, device=Q.device).unsqueeze(-1)
+                        k_idx = torch.arange(j_start, j_end, device=Q.device).unsqueeze(0)
+                        Sij = Sij.masked_fill(q_idx < k_idx, -1e6)
                     
                     # m_new = max(m_old, rowmax(S_ij))
                     mi_new = torch.maximum(mi, Sij.max(dim=-1).values)
@@ -141,7 +146,7 @@ def flash_fwd_kernel(
         if IS_CAUSAL:
             q_idx = query_tile_idx * Q_TILE_SIZE + tl.arange(0, Q_TILE_SIZE)
             k_idx = j * K_TILE_SIZE + tl.arange(0, K_TILE_SIZE)
-            Sij = tl.where(q_idx[:, None] >= k_idx[None, :], Sij, float('-inf'))
+            Sij = tl.where(q_idx[:, None] >= k_idx[None, :], Sij, -1e6)
         
         # Online softmax
         mi_new = tl.maximum(mi, tl.max(Sij, axis=1))
@@ -192,6 +197,7 @@ class FlashAttentionFunctionTriton(torch.autograd.Function):
         )
         
         ctx.save_for_backward(Q, K, V, O, L)
+        ctx.is_causal = is_causal
         return O
 
     @staticmethod
