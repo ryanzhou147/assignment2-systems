@@ -1,5 +1,7 @@
 import torch
 import math
+import triton
+import triton.language as tl
 
 class FlashAttentionFunctionPyTorch(torch.autograd.Function):
 
@@ -60,6 +62,134 @@ class FlashAttentionFunctionPyTorch(torch.autograd.Function):
                 # Final normalization
                 O[b, i_start:i_end] = Oi / li.unsqueeze(-1)
                 L[b, i_start:i_end] = mi + torch.log(li)
+        
+        ctx.save_for_backward(Q, K, V, O, L)
+        return O
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        raise NotImplementedError
+    
+@triton.jit
+def flash_fwd_kernel(
+    Q_ptr, K_ptr, V_ptr,
+    O_ptr, L_ptr,
+    stride_qb, stride_qq, stride_qd,
+    stride_kb, stride_kk, stride_kd,
+    stride_vb, stride_vk, stride_vd,
+    stride_ob, stride_oq, stride_od,
+    stride_lb, stride_lq,
+    N_QUERIES, N_KEYS,
+    scale,
+    IS_CAUSAL: tl.constexpr,
+    D: tl.constexpr,
+    Q_TILE_SIZE: tl.constexpr,
+    K_TILE_SIZE: tl.constexpr,
+):
+    query_tile_idx = tl.program_id(0)
+    batch_idx = tl.program_id(1)
+    
+    # Block pointers
+    Q_block_ptr = tl.make_block_ptr(
+        Q_ptr + batch_idx * stride_qb,
+        shape=(N_QUERIES, D), strides=(stride_qq, stride_qd),
+        offsets=(query_tile_idx * Q_TILE_SIZE, 0),
+        block_shape=(Q_TILE_SIZE, D), order=(1, 0),
+    )
+    K_block_ptr = tl.make_block_ptr(
+        K_ptr + batch_idx * stride_kb,
+        shape=(N_KEYS, D), strides=(stride_kk, stride_kd),
+        offsets=(0, 0),
+        block_shape=(K_TILE_SIZE, D), order=(1, 0),
+    )
+    V_block_ptr = tl.make_block_ptr(
+        V_ptr + batch_idx * stride_vb,
+        shape=(N_KEYS, D), strides=(stride_vk, stride_vd),
+        offsets=(0, 0),
+        block_shape=(K_TILE_SIZE, D), order=(1, 0),
+    )
+    O_block_ptr = tl.make_block_ptr(
+        O_ptr + batch_idx * stride_ob,
+        shape=(N_QUERIES, D), strides=(stride_oq, stride_od),
+        offsets=(query_tile_idx * Q_TILE_SIZE, 0),
+        block_shape=(Q_TILE_SIZE, D), order=(1, 0),
+    )
+    L_block_ptr = tl.make_block_ptr(
+        L_ptr + batch_idx * stride_lb,
+        shape=(N_QUERIES,), strides=(stride_lq,),
+        offsets=(query_tile_idx * Q_TILE_SIZE,),
+        block_shape=(Q_TILE_SIZE,), order=(0,),
+    )
+    
+    # Load Q once
+    Qi = tl.load(Q_block_ptr)
+    
+    # On-chip accumulators (float32 for precision)
+    Oi = tl.zeros((Q_TILE_SIZE, D), dtype=tl.float32)
+    li = tl.zeros((Q_TILE_SIZE,), dtype=tl.float32)
+    mi = tl.full((Q_TILE_SIZE,), float('-inf'), dtype=tl.float32)
+    
+    # Loop over key tiles
+    for j in range(tl.cdiv(N_KEYS, K_TILE_SIZE)):
+        Kj = tl.load(K_block_ptr)
+        Vj = tl.load(V_block_ptr)
+        
+        # Attention scores
+        Sij = tl.dot(Qi, tl.trans(Kj)) * scale
+        
+        # Causal mask
+        if IS_CAUSAL:
+            q_idx = query_tile_idx * Q_TILE_SIZE + tl.arange(0, Q_TILE_SIZE)
+            k_idx = j * K_TILE_SIZE + tl.arange(0, K_TILE_SIZE)
+            Sij = tl.where(q_idx[:, None] >= k_idx[None, :], Sij, float('-inf'))
+        
+        # Online softmax
+        mi_new = tl.maximum(mi, tl.max(Sij, axis=1))
+        Pij = tl.exp(Sij - mi_new[:, None])
+        alpha = tl.exp(mi - mi_new)
+        li = alpha * li + tl.sum(Pij, axis=1)
+        Oi = alpha[:, None] * Oi + tl.dot(Pij.to(Vj.dtype), Vj)
+        mi = mi_new
+        
+        # Advance pointers
+        K_block_ptr = tl.advance(K_block_ptr, (K_TILE_SIZE, 0))
+        V_block_ptr = tl.advance(V_block_ptr, (K_TILE_SIZE, 0))
+    
+    # Normalize and store
+    Oi = Oi / li[:, None]
+    tl.store(O_block_ptr, Oi.to(O_block_ptr.type.element_ty))
+    tl.store(L_block_ptr, (mi + tl.log(li)).to(L_block_ptr.type.element_ty))
+
+
+class FlashAttentionFunctionTriton(torch.autograd.Function):
+    
+    Q_TILE_SIZE = 64
+    K_TILE_SIZE = 64
+
+    @staticmethod
+    def forward(ctx, Q, K, V, is_causal=False):
+        batch, Nq, d = Q.shape
+        _, Nk, _ = K.shape
+        
+        O = torch.empty_like(Q)
+        L = torch.empty(batch, Nq, device=Q.device, dtype=Q.dtype)
+        
+        grid = (triton.cdiv(Nq, FlashAttentionFunctionTriton.Q_TILE_SIZE), batch)
+        
+        flash_fwd_kernel[grid](
+            Q, K, V, O, L,
+            Q.stride(0), Q.stride(1), Q.stride(2),
+            K.stride(0), K.stride(1), K.stride(2),
+            V.stride(0), V.stride(1), V.stride(2),
+            O.stride(0), O.stride(1), O.stride(2),
+            L.stride(0), L.stride(1),
+            Nq, Nk,
+            1.0 / math.sqrt(d),
+            is_causal,
+            d,
+            FlashAttentionFunctionTriton.Q_TILE_SIZE,
+            FlashAttentionFunctionTriton.K_TILE_SIZE,
+        )
         
         ctx.save_for_backward(Q, K, V, O, L)
         return O
