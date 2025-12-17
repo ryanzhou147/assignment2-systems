@@ -71,10 +71,95 @@ class FlashAttentionFunctionPyTorch(torch.autograd.Function):
         ctx.save_for_backward(Q, K, V, O, L)
         return O
 
+    # @staticmethod
+    # def backward(ctx, grad_output):
+
+    #     Q, K, V, O, L = ctx.saved_tensors
+    #     scale = 1.0 / math.sqrt(Q.shape[-1])
+
+    #     Sij = Q @ K.transpose(-2, -1) / math.sqrt(Q.shape[-1])
+    #     Pij = torch.exp(Sij - L.unsqueeze(-1))
+    #     dO = grad_output
+    #     dV = Pij.transpose(-2, -1) @ dO
+    #     dP = dO @ V.transpose(-2, -1)
+    #     Di = torch.sum(dP * Pij, dim=-1, keepdim=True)
+    #     dS = Pij * (dP - Di)
+    #     dQ = dS @ K * scale
+    #     dK = dS.transpose(-2, -1) @ Q * scale
+    #     return dQ, dK, dV, None
+    
     @staticmethod
     def backward(ctx, grad_output):
-        raise NotImplementedError
-    
+        Q, K, V, O, L = ctx.saved_tensors
+        
+        batch, Nq, d = Q.shape
+        _, Nk, _ = K.shape
+        scale = 1.0 / math.sqrt(d)
+        
+        Bq, Bk = 16, 16
+        Tq = math.ceil(Nq / Bq)
+        Tk = math.ceil(Nk / Bk)
+        
+        # Initialize gradients
+        dQ = torch.zeros_like(Q)
+        dK = torch.zeros_like(K)
+        dV = torch.zeros_like(V)
+        
+        # Precompute Di = rowsum(dO * O) for all positions
+        # This is needed for every tile, so compute once
+        Di = torch.sum(grad_output * O, dim=-1)  # (batch, Nq)
+        
+        for b in range(batch):
+            Qb = Q[b]      # (Nq, d)
+            Kb = K[b]      # (Nk, d)
+            Vb = V[b]      # (Nk, d)
+            Ob = O[b]      # (Nq, d)
+            Lb = L[b]      # (Nq,)
+            dOb = grad_output[b]  # (Nq, d)
+            Dib = Di[b]    # (Nq,)
+            
+            for i in range(Tq):
+                i_start, i_end = i * Bq, min((i + 1) * Bq, Nq)
+                
+                Qi = Qb[i_start:i_end]      # (Bq, d)
+                Oi = Ob[i_start:i_end]      # (Bq, d)
+                Li = Lb[i_start:i_end]      # (Bq,)
+                dOi = dOb[i_start:i_end]    # (Bq, d)
+                Dii = Dib[i_start:i_end]    # (Bq,)
+                
+                dQi = torch.zeros_like(Qi)  # Accumulate dQ for this tile
+                
+                for j in range(Tk):
+                    j_start, j_end = j * Bk, min((j + 1) * Bk, Nk)
+                    
+                    Kj = Kb[j_start:j_end]  # (Bk, d)
+                    Vj = Vb[j_start:j_end]  # (Bk, d)
+                    
+                    # Recompute attention scores for this tile
+                    Sij = (Qi @ Kj.T) * scale  # (Bq, Bk)
+                    
+                    # Recompute P using saved logsumexp
+                    Pij = torch.exp(Sij - Li.unsqueeze(-1))  # (Bq, Bk)
+                    
+                    # dV += P^T @ dO
+                    dV[b, j_start:j_end] += Pij.T @ dOi  # (Bk, d)
+                    
+                    # dP = dO @ V^T
+                    dPij = dOi @ Vj.T  # (Bq, Bk)
+                    
+                    # dS = P * (dP - Di)
+                    dSij = Pij * (dPij - Dii.unsqueeze(-1))  # (Bq, Bk)
+                    
+                    # dQ += dS @ K * scale
+                    dQi += (dSij @ Kj) * scale  # (Bq, d)
+                    
+                    # dK += dS^T @ Q * scale
+                    dK[b, j_start:j_end] += (dSij.T @ Qi) * scale  # (Bk, d)
+                
+                dQ[b, i_start:i_end] = dQi
+        
+        return dQ, dK, dV, None
+
 @triton.jit
 def flash_fwd_kernel(
     Q_ptr, K_ptr, V_ptr,
