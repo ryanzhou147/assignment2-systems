@@ -70,23 +70,6 @@ class FlashAttentionFunctionPyTorch(torch.autograd.Function):
         
         ctx.save_for_backward(Q, K, V, O, L)
         return O
-
-    # @staticmethod
-    # def backward(ctx, grad_output):
-
-    #     Q, K, V, O, L = ctx.saved_tensors
-    #     scale = 1.0 / math.sqrt(Q.shape[-1])
-
-    #     Sij = Q @ K.transpose(-2, -1) / math.sqrt(Q.shape[-1])
-    #     Pij = torch.exp(Sij - L.unsqueeze(-1))
-    #     dO = grad_output
-    #     dV = Pij.transpose(-2, -1) @ dO
-    #     dP = dO @ V.transpose(-2, -1)
-    #     Di = torch.sum(dP * Pij, dim=-1, keepdim=True)
-    #     dS = Pij * (dP - Di)
-    #     dQ = dS @ K * scale
-    #     dK = dS.transpose(-2, -1) @ Q * scale
-    #     return dQ, dK, dV, None
     
     @staticmethod
     def backward(ctx, grad_output):
@@ -106,7 +89,6 @@ class FlashAttentionFunctionPyTorch(torch.autograd.Function):
         dV = torch.zeros_like(V)
         
         # Precompute Di = rowsum(dO * O) for all positions
-        # This is needed for every tile, so compute once
         Di = torch.sum(grad_output * O, dim=-1)  # (batch, Nq)
         
         for b in range(batch):
