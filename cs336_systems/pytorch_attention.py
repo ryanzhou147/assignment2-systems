@@ -55,5 +55,3 @@ if __name__ == "__main__":
                 if 'out of memory' in str(e).lower():
                     print(f"OOM for d_model={d_model}, seq_len={seq_len}")
                     torch.cuda.empty_cache()
-                else:
-                    raise
