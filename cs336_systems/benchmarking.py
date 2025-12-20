@@ -91,6 +91,112 @@ def benchmark_transformer(vocab_size: int, context_length: int, num_layers: int,
     print(f"Average time per step ({'forward + backward' if backward else 'forward only'}): {avg_time_per_step:.6f} seconds +/- {std_time_per_step:.6f} seconds")
     return avg_time_per_step
 
+import triton.testing.do_bench
+
+# Write a benchmarking script using triton.testing.do_bench that compares the performance
+# of your (partially) Triton implementation of FlashAttention-2 forward and backward passes with
+# a regular PyTorch implementation (i.e., not using FlashAttention).
+# Specifically, you will report a table that includes latencies for forward, backward, and the endto-end forward-backward pass, for both your Triton and PyTorch implementations. Randomly
+# generate any necessary inputs before you start benchmarking, and run the benchmark on a single
+# H100. Always use batch size 1 and causal masking. Sweep over the cartesian product of sequence
+# lengths of various powers of 2 from 128 up to 65536, embedding dimension sizes of various powers
+# of 2 from 16 up to size 128, and precisions of torch.bfloat16 and torch.float32. You will
+# likely need to adjust tile sizes depending on the input sizes.
+# Deliverable: A table of results comparing your implementation of FlashAttention-2 with the
+# PyTorch implementation, using the settings above and reporting forward, backward, and end-toend latencies.
+
+def triton_vs_pytorch_flash_attention_benchmark():
+    import cs336_systems.flash_forward
+    import cs336_systems.pytorch_attention
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    batch_size = 1
+    head_dims = [16, 32, 64, 128]
+    seq_lengths = [128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536]
+    precisions = [torch.float32, torch.bfloat16]
+
+    results = []
+
+    for d_model in head_dims:
+        for seq_len in seq_lengths:
+            for precision in precisions:
+                try:
+                    torch.cuda.empty_cache()
+                    torch.cuda.reset_peak_memory_stats()
+                    
+                    # Initialize models
+                    triton_mha = cs336_systems.flash_forward.FlashAttentionModule(d_model=d_model, num_heads=1, device=device).to(device).to(precision)
+                    pytorch_mha = cs336_systems.pytorch_attention.MultiHeadSelfAttention(d_model=d_model, num_heads=1, device=device).to(device).to(precision)
+
+                    # Generate random input
+                    Q = torch.randn((batch_size, seq_len, d_model), device=device, dtype=precision, requires_grad=True)
+
+                    # Warmup
+                    for _ in range(10):
+                        out_triton = triton_mha(Q)
+                        out_triton.mean().backward()
+                        triton_mha.zero_grad()
+
+                        out_pytorch = pytorch_mha(Q)
+                        out_pytorch.mean().backward()
+                        pytorch_mha.zero_grad()
+                    torch.cuda.synchronize()
+
+                    # Time forward passes
+                    torch.cuda.synchronize()
+                    start = timeit.default_timer()
+                    for _ in range(10):
+                        out_triton = triton_mha(Q)
+                        torch.cuda.synchronize()
+                    triton_forward_time = timeit.default_timer() - start
+
+                    torch.cuda.synchronize()
+                    start = timeit.default_timer()
+                    for _ in range(10):
+                        out_pytorch = pytorch_mha(Q)
+                        torch.cuda.synchronize()
+                    pytorch_forward_time = timeit.default_timer() - start
+
+                    # Time backward passes
+                    torch.cuda.synchronize()
+                    start = timeit.default_timer()
+                    for _ in range(10):
+                        out_triton = triton_mha(Q)
+                        torch.cuda.synchronize()
+                        out_triton.mean().backward()
+                        torch.cuda.synchronize()
+                        triton_mha.zero_grad()
+                    triton_backward_time = timeit.default_timer() - start
+                    torch.cuda.synchronize()
+                    start = timeit.default_timer()
+                    for _ in range(10):
+                        out_pytorch = pytorch_mha(Q)
+                        torch.cuda.synchronize()
+                        out_pytorch.mean().backward()
+                        torch.cuda.synchronize()
+                        pytorch_mha.zero_grad()
+                    pytorch_backward_time = timeit.default_timer() - start
+                    # Store results
+                    results.append({
+                        'd_model': d_model,
+                        'seq_len': seq_len,
+                        'precision': str(precision).split('.')[-1],
+                        'triton_forward_time': triton_forward_time / 10,
+                        'pytorch_forward_time': pytorch_forward_time / 10,
+                        'triton_backward_time': triton_backward_time / 10,
+                        'pytorch_backward_time': pytorch_backward_time / 10,
+                    })
+                except RuntimeError as e:
+                    if 'out of memory' in str(e).lower():
+                        print(f"OOM for d_model={d_model}, seq_len={seq_len}, precision={precision}")
+                        torch.cuda.empty_cache()
+    # Print results
+    print(f"{'d_model':>8} {'seq_len':>8} {'precision':>10} {'triton_fwd(s)':>15} {'pytorch_fwd
+    '(s)':>15} {'triton_bwd(s)':>15} {'pytorch_bwd(s)':>15}")
+    for res in results:
+        print(f"{res['d_model']:>8} {res['seq_len']:>8} {res['precision']:>10} {res['triton_forward_time']:>15.6f} {res['pytorch_forward_time']:>15.6f} {res['triton_backward_time']:>15.6f} {res['pytorch_backward_time']:>15.6f}")
+        
+
 if __name__ == "__main__":
     import argparse
 
